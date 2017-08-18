@@ -539,7 +539,7 @@ int sub_4E760C_getpos(int hash, int count)
 ////////////反编译出来的代码-结束//////////////////
 
 
-////////////来自 quickbms 和 exfp3 部分代码-开始//////////////////
+////////////来自 exfp3 部分代码-开始//////////////////
 static const unsigned char BPE_FLAG_SHORT_LENGTH = 0x01;
 
 typedef struct bpe_hdr_t {
@@ -552,12 +552,6 @@ typedef struct bpe_pair_t {
 	unsigned char left;
 	unsigned char right;
 } bpe_pair_t;
-
-typedef struct bpe_hash_t {
-	unsigned char left;
-	unsigned char right;
-	unsigned char count;
-} bpe_hash_t;
 
 // byte pair encoding algorithm
 static void unbpe(unsigned char* buff, unsigned int len,
@@ -634,244 +628,7 @@ static void unbpe(unsigned char* buff, unsigned int len,
 	}
 }
 
-/* return index of character pair in hash table */
-/* deleted nodes have a count of 1 for hashing */
-static unsigned int lookup(bpe_hash_t *h, unsigned char a, unsigned char b, unsigned int hs)
-{
-	unsigned int index;
-	/* ?  - will add question marks until I understand each variable */
-
-	/* compute hash key from both characters */
-	index = (a ^ (b << 5)) & (hs - 1);
-	/* if b = 10110101 then '(b << 5)' --> b = 10100000. */
-	/* ie shift the bits in b left by five positions and fill holes with zeros */
-
-	/* search for pair or first empty slot */
-	while ((h[index].left != a || h[index].right != b) && h[index].count != 0) {
-		index = (index + 1) & (hs - 1);
-	}
-
-	h[index].left = a;
-	h[index].right = b;
-	return index;
-}
-
-// byte pair encoding algorithm
-static unsigned int enbpe(unsigned char* buff, unsigned int buf_len, unsigned char* out_buff)
-{
-	unsigned int bs = 20000;
-	unsigned int hs = 16384;
-	unsigned int mc = 200;
-	unsigned int th = 3;
-
-	bpe_pair_t     pair_table[256];
-	bpe_hash_t     hash_table[65536 + 1];
-	unsigned char  buffer[20000];
-	unsigned char* end = buff + buf_len;
-
-	unsigned int c, index, size, used;
-	unsigned int leftch = 0, rightch = 0, oldsize;
-	unsigned int r, w, best, len, i;
-	unsigned int outlen = 0;
-	int code;
-
-	while (buff < end)
-	{
-		size = used = 0;
-
-		/* reset hash table and pair table */
-		for (c = 0; c < hs; c++) {
-			hash_table[c].count = 0;
-		}
-
-		for (c = 0; c < 256; c++) {
-			pair_table[c].left = c;
-			pair_table[c].right = 0;
-		}
-
-		/* read data until full or few unused chars */
-		while (size < bs && used < mc && buff < end)
-		{
-			c = *buff++;
-			if (size > 0)
-			{
-				index = lookup(hash_table, buffer[size - 1], c, hs);
-				if (hash_table[index].count < 255) {
-					++hash_table[index].count;
-				}
-			}
-
-			buffer[size++] = c;
-
-			/* use right code to flag data chars found */
-			if (!pair_table[c].right) {
-				pair_table[c].right = 1;
-				used++;
-			}
-		}
-
-		code = 256;
-		/* compress this block */
-		for (;;)
-		{
-			/* get next unused chr for pair code */
-			for (code--; code >= 0; code--)
-			{
-				if (code == pair_table[code].left && !pair_table[code].right) {
-					break;
-				}
-			}
-
-			/* must quit if no unused chars left */
-			if (code < 0) {
-				break;
-			}
-
-			/* find most frequent pair of chars */
-			for (best = 2, index = 0; index < hs; index++)
-			{
-				if (hash_table[index].count > best)
-				{
-					best = hash_table[index].count;
-					leftch = hash_table[index].left;
-					rightch = hash_table[index].right;
-				}
-			}
-
-			/* done if no more compression possible */
-			if (best < th) {
-				break;
-			}
-
-			/* Replace pairs in data, adjust pair counts */
-			oldsize = size - 1;
-			for (w = 0, r = 0; r < oldsize; r++)
-			{
-				if (buffer[r] == leftch && buffer[r + 1] == rightch)
-				{
-					if (r > 0)
-					{
-						index = lookup(hash_table, buffer[w - 1], leftch, hs);
-						if (hash_table[index].count > 1) {
-							--hash_table[index].count;
-						}
-						index = lookup(hash_table, buffer[w - 1], code, hs);
-						if (hash_table[index].count < 255) {
-							++hash_table[index].count;
-						}
-					}
-					if (r < oldsize - 1)
-					{
-						index = lookup(hash_table, rightch, buffer[r + 2], hs);
-						if (hash_table[index].count > 1) {
-							--hash_table[index].count;
-						}
-						index = lookup(hash_table, code, buffer[r + 2], hs);
-						if (hash_table[index].count < 255) {
-							++hash_table[index].count;
-						}
-					}
-					buffer[w++] = code;
-					r++;
-					size--;
-				}
-				else
-				{
-					buffer[w++] = buffer[r];
-				}
-			}
-			buffer[w] = buffer[r];
-
-			/* add to pair substitution table */
-			pair_table[code].left = leftch;
-			pair_table[code].right = rightch;
-
-			/* delete pair from hash table */
-			index = lookup(hash_table, leftch, rightch, hs);
-			hash_table[index].count = 1;
-		}
-
-		c = 0;
-		if (out_buff)
-		{
-			((bpe_hdr_t *)out_buff)->original_length = buf_len;
-			((bpe_hdr_t *)out_buff)->flags = BPE_FLAG_SHORT_LENGTH;
-			memcpy(((bpe_hdr_t *)out_buff)->signature, "1PC\xFF", 4);
-		}
-		outlen += sizeof(bpe_hdr_t);
-
-		/* for each character 0..255 */
-		while (c < 256)
-		{
-			/* if not a pair code, count run of literals */
-			if (c == pair_table[c].left)
-			{
-				len = 1; c++;
-				while (len < 127 && c < 256 && c == pair_table[c].left) {
-					len++; c++;
-				}
-
-				if (out_buff)
-					*(out_buff + outlen) = len + 127;
-				outlen++;
-
-				len = 0;
-				if (c == 256) {
-					break;
-				}
-			}
-
-			/* else count run of pair codes */
-			else
-			{
-				len = 0;
-				c++;
-
-				/* original, will add extra brackets per compiler suggestions: */
-				while ((len < 127 && c < 256 && c != pair_table[c].left) ||
-					(len < 125 && c < 254 && c + 1 != pair_table[c + 1].left))
-				{
-					len++;
-					c++;
-				}
-
-				if (out_buff)
-					*(out_buff + outlen) = len;
-				outlen++;
-
-				c -= len + 1;
-			}
-
-			/* write range of pairs to output */
-			for (i = 0; i <= len; i++)
-			{
-				if (out_buff)
-					*(out_buff + outlen) = pair_table[c].left;
-				outlen++;
-
-				if (c != pair_table[c].left)
-				{
-					if (out_buff)
-						*(out_buff + outlen) = pair_table[c].right;
-					outlen++;
-				}
-				c++;
-			}
-		}
-
-		/* write size bytes and compressed data block */
-		if (out_buff) {
-			*(out_buff + outlen) = size % 256;
-			*(out_buff + outlen + 1) = size / 256;
-			memcpy(out_buff + outlen + 2, buffer, size);
-		}
-		outlen += 2 + size;
-	}
-
-	return outlen;
-}
-
-////////////来自 quickbms 和 exfp3 部分代码-结束//////////////////
+////////////来自 exfp3 部分代码-结束//////////////////
 
 //读入文件
 static unsigned char * get_file(wchar_t *file, unsigned int *len)
@@ -919,15 +676,119 @@ static void put_file(wchar_t *file, unsigned char *data, unsigned int len)
 	fclose(fp);
 }
 
-//枚举目录
+//通配符比较
+int match_with_asterisk(wchar_t* str1, wchar_t* pattern)
+{
+	if (str1 == NULL) {
+		return -1;
+	}
+
+	if (pattern == NULL) {
+		return -1;
+	}
+
+	int len1 = wcslen(str1);
+	int len2 = wcslen(pattern);
+	int p1 = 0, p2 = 0;
+
+	//用于分段标记,'*'分隔的字符串
+	int mark = 0;
+
+	while (p1 < len1 && p2 < len2)
+	{
+		if (pattern[p2] == '?')
+		{
+			p1++; p2++;
+			continue;
+		}
+		if (pattern[p2] == '*')
+		{
+			/*如果当前是*号，则mark前面一部分已经获得匹配，
+			*从当前点开始继续下一个块的匹配
+			*/
+			p2++;
+			mark = p2;
+			continue;
+		}
+		if (str1[p1] != pattern[p2])
+		{
+			if (p1 == 0 && p2 == 0)
+			{
+				/*
+				* 如果是首字符，特殊处理，不相同即匹配失败
+				*/
+				return -1;
+			}
+			/*
+			* pattern: ...*bdef*...
+			*       ^
+			*       mark
+			*        ^
+			*        p2
+			*       ^
+			*       new p2
+			* str1:.....bdcf...
+			*       ^
+			*       p1
+			*      ^
+			*     new p1
+			* 如上示意图所示，在比到e和c处不想等
+			* p2返回到mark处，
+			* p1需要返回到下一个位置。
+			* 因为*前已经获得匹配，所以mark打标之前的不需要再比较
+			*/
+			p1 -= p2 - mark - 1;
+			p2 = mark;
+			continue;
+		}
+		/*
+		* 此处处理相等的情况
+		*/
+		p1++;
+		p2++;
+	}
+	if (p2 == len2)
+	{
+		if (p1 == len1)
+		{
+			/*
+			* 两个字符串都结束了，说明模式匹配成功
+			*/
+			return 0;
+		}
+		if (pattern[p2 - 1] == '*')
+		{
+			/*
+			* str1还没有结束，但pattern的最后一个字符是*，所以匹配成功
+			*
+			*/
+			return 0;
+		}
+	}
+	while (p2 < len2)
+	{
+		/*
+		* pattern多出的字符只要有一个不是*,匹配失败
+		*
+		*/
+		if (pattern[p2] != '*') {
+			return -1;
+		}
+		p2++;
+	}
+
+	return -1;
+}
+
+//枚举文件
 static void enum_file(wchar_t *in_path, wchar_t *findname, wchar_t **out_filename[], int *out_size)
 {
 	wchar_t filename[1024];
-	wcscat(wcscat(wcscpy(filename, in_path), L"\\"), findname);
+	wcscat(wcscpy(filename, in_path), L"\\*");
 
 	struct _wfinddata64_t data;
 	intptr_t handle = _wfindfirst64(filename, &data);
-	if (handle)
+	if (-1 != handle)
 	{
 		do
 		{
@@ -941,16 +802,19 @@ static void enum_file(wchar_t *in_path, wchar_t *findname, wchar_t **out_filenam
 			}
 			else
 			{
-				if (NULL == *out_filename) {
-					*out_filename = (wchar_t **)malloc(sizeof(wchar_t *) * (*out_size + 1));
-				}
-				else {
-					*out_filename = (wchar_t **)realloc(*out_filename, sizeof(wchar_t *) * (*out_size + 1));
-				}
+				if (0 == match_with_asterisk(data.name, findname))
+				{
+					if (NULL == *out_filename) {
+						*out_filename = (wchar_t **)malloc(sizeof(wchar_t *) * (*out_size + 1));
+					}
+					else {
+						*out_filename = (wchar_t **)realloc(*out_filename, sizeof(wchar_t *) * (*out_size + 1));
+					}
 
-				(*out_filename)[*out_size] = (wchar_t *)malloc(wcslen(in_path) * 2 + 2 + wcslen(data.name) * 2 + 2);
-				wcscat(wcscat(wcscpy((*out_filename)[*out_size], in_path), L"\\"), data.name);
-				(*out_size)++;
+					(*out_filename)[*out_size] = (wchar_t *)malloc(wcslen(in_path) * 2 + 2 + wcslen(data.name) * 2 + 2);
+					wcscat(wcscat(wcscpy((*out_filename)[*out_size], in_path), L"\\"), data.name);
+					(*out_size)++;
+				}
 			}
 		}
 		while (0 == _tfindnext64(handle, &data));
@@ -1060,117 +924,120 @@ static int file_unpack(wchar_t *in_file, wchar_t *out_path)
 		PACKHEAD pack_head;
 		fseek(fp, fplen - sizeof(pack_head), SEEK_SET);
 		fread(&pack_head, 1, sizeof(pack_head), fp);
-
-		PACKKEY pack_key;
-		fseek(fp, fplen - sizeof(pack_key) - sizeof(pack_head), SEEK_SET);
-		fread(&pack_key, 1, sizeof(pack_key), fp);
-
-		PACKHASH *pack_hash = (PACKHASH *)malloc(pack_key.hash_size);
-		fseek(fp, fplen - sizeof(pack_key) - sizeof(pack_head) - pack_key.hash_size, SEEK_SET);
-		fread(pack_hash, 1, pack_key.hash_size, fp);
-
-		//解密hash结构内的数据
-		unsigned int hash_datalen = pack_hash->data_size;
-		unsigned char *hash_data = (unsigned char *)pack_hash + sizeof(PACKHASH);
-		sub_4E182C_uncrypt(0x0428, hash_data, hash_datalen);
-
-		//解压hash_data
-		if (pack_hash->is_compressed)
+		if (0 == memcmp(pack_head.signature, "FilePackVer3.1\x00\x00", 16))
 		{
-			unsigned int temp_len = ((bpe_hdr_t *)hash_data)->original_length;
-			unsigned char *temp = (unsigned char *)malloc(temp_len);
-			unbpe(hash_data, hash_datalen, temp, temp_len);
+			PACKKEY pack_key;
+			fseek(fp, fplen - sizeof(pack_key) - sizeof(pack_head), SEEK_SET);
+			fread(&pack_key, 1, sizeof(pack_key), fp);
 
-			free(hash_data);
-			hash_datalen = temp_len;
-			hash_data = temp;
-		}
+			PACKHASH *pack_hash = (PACKHASH *)malloc(pack_key.hash_size);
+			fseek(fp, fplen - sizeof(pack_key) - sizeof(pack_head) - pack_key.hash_size, SEEK_SET);
+			fread(pack_hash, 1, pack_key.hash_size, fp);
 
-		//根据key算出解密用的值
-		int key = sub_4E2578_gethash(pack_key.key, 256) & 0x0FFFFFFF;
-		sub_4E182C_uncrypt(key, pack_key.signature, sizeof(pack_key.signature)); //解密
-		if (0 == strncmp((char *)pack_key.signature, "8hr48uky,8ugi8ewra4g8d5vbf5hb5s6", 32))
-		{
-			unsigned int commkey[256];
-			fseek(fp, pack_head.entry_offset, SEEK_SET);
-			for (unsigned int i = 0; i < pack_head.entry_count; i++)
+			//解密hash结构内的数据
+			unsigned int hash_datalen = pack_hash->data_size;
+			unsigned char *hash_data = (unsigned char *)pack_hash + sizeof(PACKHASH);
+			sub_4E182C_uncrypt(0x0428, hash_data, hash_datalen);
+
+			//解压hash_data
+			if (pack_hash->is_compressed)
 			{
-				//取得文件名
-				unsigned short namelen;
-				fread(&namelen, 1, sizeof(namelen), fp);
-				wchar_t *name = (wchar_t *)malloc(namelen * 2 + 2);
-				fread(name, 1, namelen * 2, fp);
-				name[namelen] = 0;
+				unsigned int temp_len = ((bpe_hdr_t *)hash_data)->original_length;
+				unsigned char *temp = (unsigned char *)malloc(temp_len);
+				unbpe(hash_data, hash_datalen, temp, temp_len);
 
-				//取文件信息
-				PACKENTRY entry;
-				fread(&entry, 1, sizeof(entry), fp);
+				free(hash_data);
+				hash_datalen = temp_len;
+				hash_data = temp;
+			}
 
-				//解密文件名
-				sub_4E11C3_crypt(key, (unsigned char *)name, namelen);
-				wprintf(L"%s...", name);
-
-				unsigned int cur_pos = ftell(fp);
-				fseek(fp, entry.offset, SEEK_SET);
-
-				//读取文件
-				unsigned int datalen = entry.length;
-				unsigned char *data = (unsigned char *)malloc(datalen);
-				fread(data, 1, datalen, fp);
-
-				//校验
-				if (entry.hash == sub_4E2578_gethash(data, datalen))
+			//根据key算出解密用的值
+			int key = sub_4E2578_gethash(pack_key.key, 256) & 0x0FFFFFFF;
+			sub_4E182C_uncrypt(key, pack_key.signature, sizeof(pack_key.signature)); //解密
+			if (0 == strncmp((char *)pack_key.signature, "8hr48uky,8ugi8ewra4g8d5vbf5hb5s6", 32))
+			{
+				unsigned int commkey[256];
+				fseek(fp, pack_head.entry_offset, SEEK_SET);
+				for (unsigned int i = 0; i < pack_head.entry_count; i++)
 				{
-					if (entry.is_obfuscated > 0)
-					{
-						if (1 == entry.is_obfuscated)
-						{
-							//解密算法1
-							unsigned int filekey[64];
-							sub_4E8E64_createkey(filekey, 64, (unsigned short *)name, namelen, datalen, key);
-							sub_4E9014_uncrypt(data, datalen, filekey);
+					//取得文件名
+					unsigned short namelen;
+					fread(&namelen, 1, sizeof(namelen), fp);
+					wchar_t *name = (wchar_t *)malloc(namelen * 2 + 2);
+					fread(name, 1, namelen * 2, fp);
+					name[namelen] = 0;
 
-							//特殊文件 pack_keyfile_kfueheish15538fa9or.key 算出一个key
-							if (0 == wcsncmp(L"pack_keyfile_kfueheish15538fa9or.key", name, namelen)) {
-								sub_4E9ECC_createkey(commkey, data, datalen);
+					//取文件信息
+					PACKENTRY entry;
+					fread(&entry, 1, sizeof(entry), fp);
+
+					//解密文件名
+					sub_4E11C3_crypt(key, (unsigned char *)name, namelen);
+					wprintf(L"%s...", name);
+
+					unsigned int cur_pos = ftell(fp);
+					fseek(fp, entry.offset, SEEK_SET);
+
+					//读取文件
+					unsigned int datalen = entry.length;
+					unsigned char *data = (unsigned char *)malloc(datalen);
+					fread(data, 1, datalen, fp);
+
+					//校验
+					if (entry.hash == sub_4E2578_gethash(data, datalen))
+					{
+						if (entry.is_obfuscated > 0)
+						{
+							if (1 == entry.is_obfuscated)
+							{
+								//解密算法1
+								unsigned int filekey[64];
+								sub_4E8E64_createkey(filekey, 64, (unsigned short *)name, namelen, datalen, key);
+								sub_4E9014_uncrypt(data, datalen, filekey);
+
+								//特殊文件 pack_keyfile_kfueheish15538fa9or.key 算出一个key
+								if (0 == wcsncmp(L"pack_keyfile_kfueheish15538fa9or.key", name, namelen)) {
+									sub_4E9ECC_createkey(commkey, data, datalen);
+								}
+							}
+							else if (2 == entry.is_obfuscated)
+							{
+								//解密算法2
+								unsigned int filekey[64];
+								sub_4E9138_createkey(filekey, 64, (unsigned short *)name, namelen, datalen, key);
+								sub_4E936D_uncrypt(data, datalen, filekey, commkey);
 							}
 						}
-						else if (2 == entry.is_obfuscated)
+
+						if (entry.is_compressed > 0)
 						{
-							//解密算法2
-							unsigned int filekey[64];
-							sub_4E9138_createkey(filekey, 64, (unsigned short *)name, namelen, datalen, key);
-							sub_4E936D_uncrypt(data, datalen, filekey, commkey);
+							//解压
+							unsigned char *newdata = (unsigned char *)malloc(entry.original_length);
+							unbpe(data, datalen, newdata, entry.original_length);
+							datalen = entry.original_length;
+							free(data); data = newdata;
 						}
-					}
 
-					if (entry.is_compressed > 0)
+						//输出文件
+						wchar_t filename[1024];
+						wcscat(wcscat(wcscpy(filename, out_path), L"\\"), name);
+						put_file(filename, data, datalen);
+						wprintf(L"ok\r\n");
+					}
+					else
 					{
-						//解压
-						unsigned char *newdata = (unsigned char *)malloc(entry.original_length);
-						unbpe(data, datalen, newdata, entry.original_length);
-						datalen = entry.original_length;
-						free(data); data = newdata;
+						wprintf(L"err\r\n");
 					}
 
-					//输出文件
-					wchar_t filename[1024];
-					wcscat(wcscat(wcscpy(filename, out_path), L"\\"), name);
-					put_file(filename, data, datalen);
-					wprintf(L"ok\r\n");
+					free(data);
+					fseek(fp, cur_pos, SEEK_SET);
+					free(name);
 				}
-				else
-				{
-					wprintf(L"err\r\n");
-				}
-
-				free(data);
-				fseek(fp, cur_pos, SEEK_SET);
-				free(name);
 			}
+
+			free(pack_hash);
 		}
-		
-		free(pack_hash);
+
 		fclose(fp);
 	}
 
@@ -1398,9 +1265,9 @@ int _tmain(int argc, TCHAR* argv[])
 	
 	if (1 == argc)
 	{
-		wprintf(L"美少女万華鏡 罪と罰の少女 [filepack 3.1] enpack / unpack tool\r\n");
-		wprintf(L"help \r\n");
+		wprintf(L"美少女万華鏡 罪と罰の少女 [filepack 3.1] enpack / unpack tool\r\n\r\n");
 
+		wprintf(L"help \r\n");
 		wprintf(L"filepack31 enpack ./data0 ./data0.pack\r\n");
 		wprintf(L"filepack31 unpack ./data0.pack ./data0\r\n");
 	}
