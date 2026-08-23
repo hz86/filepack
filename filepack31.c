@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +61,14 @@ typedef struct PACKHASH {
     uint32_t index_size;         /* 文件索引数组的字节数。 */
     uint32_t data_size;          /* 紧随本结构的哈希数据长度。 */
     uint32_t is_compressed;      /* 哈希数据压缩标志，当前写入零。 */
-    unsigned char unknown1[32];  /* 原格式保留字段。 */
+    /*
+     * EXE 的 Delphi RTTI 将该字段命名为 FSaftyDataSize（原程序拼写如此）。
+     * 非零时，哈希表读写接口要求每项关联数据的长度与此值相等；零表示不校验。
+     * TFilePack 构造函数默认设置为 4，因为每个文件名映射到一个 uint32_t 条目索引。
+     */
+    uint32_t safety_data_size;   /* 哈希项关联数据的预期长度，原版默认值为 4。 */
+    uint32_t string_hash_version; /* 文件名字符串哈希算法版本，当前版本为 0。 */
+    unsigned char reserved[24];  /* HashVer1.4 保留区，当前样本及原版写入均为零。 */
 } PACKHASH;
 
 /* 单文件条目：偏移为 64 位；长度及状态字段保持原格式的 32 位表示。 */
@@ -89,6 +97,12 @@ typedef struct BPE_HEADER {
 typedef char assert_packhead_size[(sizeof(PACKHEAD) == 28) ? 1 : -1];
 typedef char assert_packkey_size[(sizeof(PACKKEY) == 1060) ? 1 : -1];
 typedef char assert_packhash_size[(sizeof(PACKHASH) == 68) ? 1 : -1];
+typedef char assert_packhash_safety_offset[
+    (offsetof(PACKHASH, safety_data_size) == 36) ? 1 : -1];
+typedef char assert_packhash_version_offset[
+    (offsetof(PACKHASH, string_hash_version) == 40) ? 1 : -1];
+typedef char assert_packhash_reserved_offset[
+    (offsetof(PACKHASH, reserved) == 44) ? 1 : -1];
 typedef char assert_packentry_size[(sizeof(PACKENTRY) == 28) ? 1 : -1];
 typedef char assert_wchar_size[(sizeof(wchar_t) == 2) ? 1 : -1];
 
@@ -1826,6 +1840,8 @@ static int file_pack(const wchar_t *input_directory, const wchar_t *output_path)
     hash.file_count = (uint32_t)list.count;
     hash.index_size = (uint32_t)(list.count * sizeof(uint32_t));
     hash.data_size = (uint32_t)hash_data.length;
+    hash.safety_data_size = sizeof(uint32_t);
+    hash.string_hash_version = 0;
     key.hash_size = (uint32_t)(sizeof(PACKHASH) + hash_data.length);
     chain_crypt(0x0428U, hash_data.data, hash_data.length, true);
     if (!write_exact(output, &hash, sizeof(hash)) ||

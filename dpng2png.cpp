@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -35,7 +36,7 @@ constexpr std::uint64_t kMaximumSignedFileOffset =
 #pragma pack(push, 1)
 struct DpngHeader {
     unsigned char signature[4]; /* 固定签名 "DPNG"。 */
-    std::uint32_t unknown1;     /* 原格式保留字段。 */
+    std::uint32_t format_version; /* 格式版本；游戏支持版本 0 和 1。 */
     std::uint32_t entry_count;  /* 后续图块数量。 */
     std::uint32_t width;        /* 最终合成图宽度。 */
     std::uint32_t height;       /* 最终合成图高度。 */
@@ -47,8 +48,8 @@ struct DpngEntry {
     std::uint32_t width;    /* 图块绘制宽度。 */
     std::uint32_t height;   /* 图块绘制高度。 */
     std::uint32_t length;   /* 紧随本结构的内嵌图片字节数。 */
-    std::uint32_t unknown1; /* 原格式保留字段。 */
-    std::uint32_t unknown2; /* 原格式保留字段。 */
+    std::uint32_t clear_band_flag; /* 低字节为 1 时，绘制前清除所在横向条带。 */
+    std::uint32_t reserved;        /* 游戏当前解码路径未使用，写回时必须原样保留。 */
 };
 #pragma pack(pop)
 
@@ -772,15 +773,120 @@ bool save_bitmap_atomic(Gdiplus::Bitmap *bitmap, const std::wstring &output_path
     return true;
 }
 
-/* 检查图块矩形能安全转换为 GDI+ 使用的有符号 INT。 */
-bool validate_rectangle(const DpngEntry &entry)
+/* 检查图块矩形能安全转换为 GDI+ 的 INT，并且完全位于目标画布内。 */
+bool validate_rectangle(const DpngEntry &entry, const DpngHeader &header)
 {
     constexpr std::uint32_t maximum =
         static_cast<std::uint32_t>(std::numeric_limits<INT>::max());
     return entry.offset_x <= maximum && entry.offset_y <= maximum &&
            entry.width <= maximum && entry.height <= maximum &&
            entry.width <= maximum - entry.offset_x &&
-           entry.height <= maximum - entry.offset_y;
+           entry.height <= maximum - entry.offset_y &&
+           entry.offset_x <= header.width && entry.offset_y <= header.height &&
+           entry.width <= header.width - entry.offset_x &&
+           entry.height <= header.height - entry.offset_y;
+}
+
+/* 返回 GDI+ 位图锁定区域中指定扫描线的首地址。 */
+unsigned char *bitmap_row(Gdiplus::BitmapData *data, UINT row)
+{
+    return static_cast<unsigned char *>(data->Scan0) +
+           static_cast<std::ptrdiff_t>(data->Stride) *
+               static_cast<std::ptrdiff_t>(row);
+}
+
+/* 检查 LockBits 返回的每行容量是否足以容纳预期像素。 */
+bool bitmap_stride_is_valid(const Gdiplus::BitmapData &data,
+                            std::size_t row_bytes)
+{
+    const std::int64_t stride = static_cast<std::int64_t>(data.Stride);
+    const std::uint64_t absolute_stride =
+        stride < 0 ? static_cast<std::uint64_t>(-stride)
+                   : static_cast<std::uint64_t>(stride);
+    return data.Scan0 != nullptr && absolute_stride >= row_bytes;
+}
+
+/*
+ * 直接填充位图像素，避免 GDI+ 绘图管线把 Alpha 为 0 的 RGB 分量归零。
+ * 游戏的清除标志写入 0x00888888，因此隐藏颜色也属于需要保留的格式语义。
+ */
+bool fill_bitmap_rectangle(Gdiplus::Bitmap *bitmap,
+                           const Gdiplus::Rect &rectangle,
+                           std::uint32_t pixel)
+{
+    if (rectangle.Width == 0 || rectangle.Height == 0) {
+        return true;
+    }
+
+    Gdiplus::BitmapData data{};
+    if (bitmap->LockBits(&rectangle, Gdiplus::ImageLockModeWrite,
+                         PixelFormat32bppARGB, &data) != Gdiplus::Ok) {
+        return false;
+    }
+
+    const std::size_t width = static_cast<std::size_t>(rectangle.Width);
+    const std::size_t row_bytes = width * sizeof(pixel);
+    bool success = bitmap_stride_is_valid(data, row_bytes);
+    if (success) {
+        for (INT row = 0; row < rectangle.Height; ++row) {
+            auto *pixels = reinterpret_cast<std::uint32_t *>(
+                bitmap_row(&data, static_cast<UINT>(row)));
+            std::fill_n(pixels, width, pixel);
+        }
+    }
+
+    const Gdiplus::Status unlock_status = bitmap->UnlockBits(&data);
+    return success && unlock_status == Gdiplus::Ok;
+}
+
+/*
+ * 从内嵌 PNG 左上角开始逐扫描线覆盖目标画布。
+ * memcpy 同时保留 Alpha 为 0 时的 RGB，比 Graphics::DrawImage 更接近 EXE。
+ */
+bool copy_bitmap_rectangle(Gdiplus::Bitmap *destination,
+                           Gdiplus::Bitmap *source,
+                           const Gdiplus::Rect &destination_rectangle)
+{
+    if (destination_rectangle.Width == 0 ||
+        destination_rectangle.Height == 0) {
+        return true;
+    }
+
+    const Gdiplus::Rect source_rectangle(
+        0, 0, destination_rectangle.Width, destination_rectangle.Height);
+    Gdiplus::BitmapData source_data{};
+    if (source->LockBits(&source_rectangle, Gdiplus::ImageLockModeRead,
+                         PixelFormat32bppARGB, &source_data) != Gdiplus::Ok) {
+        return false;
+    }
+
+    Gdiplus::BitmapData destination_data{};
+    if (destination->LockBits(&destination_rectangle,
+                              Gdiplus::ImageLockModeWrite,
+                              PixelFormat32bppARGB,
+                              &destination_data) != Gdiplus::Ok) {
+        source->UnlockBits(&source_data);
+        return false;
+    }
+
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(destination_rectangle.Width) *
+        sizeof(std::uint32_t);
+    bool success = bitmap_stride_is_valid(source_data, row_bytes) &&
+                   bitmap_stride_is_valid(destination_data, row_bytes);
+    if (success) {
+        for (INT row = 0; row < destination_rectangle.Height; ++row) {
+            std::memcpy(bitmap_row(&destination_data, static_cast<UINT>(row)),
+                        bitmap_row(&source_data, static_cast<UINT>(row)),
+                        row_bytes);
+        }
+    }
+
+    const Gdiplus::Status destination_unlock =
+        destination->UnlockBits(&destination_data);
+    const Gdiplus::Status source_unlock = source->UnlockBits(&source_data);
+    return success && destination_unlock == Gdiplus::Ok &&
+           source_unlock == Gdiplus::Ok;
 }
 
 /*
@@ -829,8 +935,11 @@ ConversionResult convert_dpng_file(const std::wstring &input_path,
     }
     constexpr std::uint32_t maximum_dimension =
         static_cast<std::uint32_t>(std::numeric_limits<INT>::max());
-    if (header.width == 0 || header.height == 0 ||
-        header.width > maximum_dimension || header.height > maximum_dimension ||
+    constexpr std::uint32_t maximum_width =
+        maximum_dimension / sizeof(std::uint32_t);
+    if (header.format_version > 1U ||
+        header.width == 0 || header.height == 0 ||
+        header.width > maximum_width || header.height > maximum_dimension ||
         header.entry_count >
             (file_size - sizeof(DpngHeader)) / sizeof(DpngEntry)) {
         std::fwprintf(stderr, L"DPNG 尺寸或条目数量无效：%ls\n", input_path.c_str());
@@ -844,9 +953,9 @@ ConversionResult convert_dpng_file(const std::wstring &input_path,
         std::fwprintf(stderr, L"无法分配 DPNG 画布：%ls\n", input_path.c_str());
         return ConversionResult::failed;
     }
-    auto graphics = std::make_unique<Gdiplus::Graphics>(bitmap.get());
-    if (graphics->GetLastStatus() != Gdiplus::Ok ||
-        graphics->Clear(Gdiplus::Color(0, 0, 0, 0)) != Gdiplus::Ok) {
+    const Gdiplus::Rect canvas_rectangle(
+        0, 0, static_cast<INT>(header.width), static_cast<INT>(header.height));
+    if (!fill_bitmap_rectangle(bitmap.get(), canvas_rectangle, 0U)) {
         std::fwprintf(stderr, L"无法初始化 DPNG 画布：%ls\n", input_path.c_str());
         return ConversionResult::failed;
     }
@@ -865,10 +974,32 @@ ConversionResult convert_dpng_file(const std::wstring &input_path,
             return ConversionResult::failed;
         }
         position += sizeof(entry);
-        if (entry.length > file_size - position || !validate_rectangle(entry)) {
+        if (entry.length > file_size - position ||
+            !validate_rectangle(entry, header)) {
             std::fwprintf(stderr, L"DPNG 图块范围无效：%ls（条目 %u）\n",
                           input_path.c_str(), index);
             return ConversionResult::failed;
+        }
+
+        /*
+         * 游戏只检查该字段的低字节。值为 1 时，先清除图块所在的整条横向
+         * 区域，而不是只清除图块自身矩形；透明灰色值 0x00888888 与 EXE 一致。
+         */
+        if ((entry.clear_band_flag & 0xFFU) == 1U && entry.height != 0U) {
+            const Gdiplus::Rect clear_rectangle(
+                0, static_cast<INT>(entry.offset_y),
+                static_cast<INT>(header.width), static_cast<INT>(entry.height));
+            if (!fill_bitmap_rectangle(bitmap.get(), clear_rectangle,
+                                       0x00888888U)) {
+                std::fwprintf(stderr, L"DPNG 条带清除失败：%ls（条目 %u）\n",
+                              input_path.c_str(), index);
+                return ConversionResult::failed;
+            }
+        }
+
+        /* EXE 允许零长度条目；配合清除标志时，它表示只清除而不绘图。 */
+        if (entry.length == 0U) {
+            continue;
         }
 
         IStream *entry_stream = nullptr;
@@ -886,10 +1017,26 @@ ConversionResult convert_dpng_file(const std::wstring &input_path,
         Gdiplus::Status image_status = Gdiplus::GenericError;
         Gdiplus::Status draw_status = Gdiplus::GenericError;
         {
-            Gdiplus::Image image(entry_stream);
+            Gdiplus::Bitmap image(entry_stream);
             image_status = image.GetLastStatus();
             if (image_status == Gdiplus::Ok) {
-                draw_status = graphics->DrawImage(&image, destination);
+                if (image.GetWidth() < entry.width ||
+                    image.GetHeight() < entry.height) {
+                    image_status = Gdiplus::InvalidParameter;
+                }
+                else if (entry.width == 0U || entry.height == 0U) {
+                    draw_status = Gdiplus::Ok;
+                }
+                else {
+                    /*
+                     * EXE 从内嵌 PNG 左上角开始逐像素覆盖目标画布，不缩放、
+                     * 不进行 SourceOver，同时保留完全透明像素中的 RGB 分量。
+                     */
+                    draw_status = copy_bitmap_rectangle(
+                                      bitmap.get(), &image, destination)
+                                      ? Gdiplus::Ok
+                                      : Gdiplus::GenericError;
+                }
             }
         }
         entry_stream->Release();
@@ -906,8 +1053,6 @@ ConversionResult convert_dpng_file(const std::wstring &input_path,
         position += entry.length;
     }
 
-    /* 保存位图之前销毁 Graphics，避免 GDI+ 将仍在绘制的位图判定为忙碌。 */
-    graphics.reset();
     /* 图块已经完全绘制，保存前关闭输入句柄，允许 -a 安全覆盖原文件。 */
     input.reset();
     return save_bitmap_atomic(bitmap.get(), output_path, png_encoder)
