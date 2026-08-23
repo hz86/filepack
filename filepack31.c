@@ -37,8 +37,12 @@
 typedef struct PACKHEAD {
     unsigned char signature[16]; /* 固定签名 "FilePackVer3.1"。 */
     uint32_t entry_count;        /* 文件条目数量。 */
-    uint32_t entry_offset;       /* 条目表的绝对文件偏移。 */
-    uint32_t unknown1;           /* 原格式保留字段，写入时保持为零。 */
+    /*
+     * 旧代码把此字段拆成 entry_offset 和 unknown1 两个 uint32_t。
+     * 实际磁盘格式中它们分别是偏移的低、高 32 位，合并后仍占 8 字节，
+     * 因而 PACKHEAD 的 28 字节布局不变，同时可定位 4 GiB 之后的条目表。
+     */
+    uint64_t entry_offset;       /* 条目表的 64 位绝对文件偏移。 */
 } PACKHEAD;
 
 /* PACK 密钥块：位于总头之前，保存归档密钥材料及哈希块长度。 */
@@ -59,10 +63,13 @@ typedef struct PACKHASH {
     unsigned char unknown1[32];  /* 原格式保留字段。 */
 } PACKHASH;
 
-/* 单文件条目：所有位置和长度字段保持原格式的 32 位无符号表示。 */
+/* 单文件条目：偏移为 64 位；长度及状态字段保持原格式的 32 位表示。 */
 typedef struct PACKENTRY {
-    uint32_t offset;             /* 文件数据在 PACK 中的绝对偏移。 */
-    uint32_t unknown1;           /* 原格式保留字段。 */
+    /*
+     * 旧代码把此字段拆成 offset 和 unknown1 两个 uint32_t。
+     * 实际两者共同组成小端序 64 位偏移，合并后 PACKENTRY 仍为 28 字节。
+     */
+    uint64_t offset;             /* 文件数据在 PACK 中的 64 位绝对偏移。 */
     uint32_t length;             /* PACK 内实际存储长度。 */
     uint32_t original_length;    /* 解压后的原始长度。 */
     uint32_t is_compressed;      /* 非零表示数据使用 BPE 压缩。 */
@@ -1582,8 +1589,10 @@ static int file_unpack(const wchar_t *input_path, const wchar_t *output_director
         }
         name[name_length] = 0;
         name_crypt(archive_key, name, name_length);
+        /* 用减法校验区间，避免 offset + length 在恶意归档中发生整数回绕。 */
         if (!tell_position(archive, &table_position) || table_position > hash_offset ||
-            (uint64_t)entry.offset + entry.length > head.entry_offset) {
+            entry.offset > head.entry_offset ||
+            entry.length > head.entry_offset - entry.offset) {
             free(name);
             fwprintf(stderr, L"Invalid entry offset.\n");
             goto cleanup;
@@ -1651,8 +1660,8 @@ static bool prepare_file_list(FILE_LIST *list, const wchar_t *output_full_path, 
             return false;
         }
         fclose(file);
-        /* 磁盘格式字段是 uint32_t：可超过 2 GiB，但不能超过 4 GiB - 1。 */
-        if (length > UINT32_MAX || *total_size > UINT32_MAX - length) {
+        /* 单文件长度仍是 uint32_t；归档总大小和偏移则使用有符号 64 位文件 API。 */
+        if (length > UINT32_MAX || *total_size > (uint64_t)INT64_MAX - length) {
             return false;
         }
         list->items[index].size = length;
@@ -1709,7 +1718,7 @@ static int file_pack(const wchar_t *input_directory, const wchar_t *output_path)
     if (root == NULL || output_full == NULL ||
         !enumerate_tree(root, L"", &list) ||
         !prepare_file_list(&list, output_full, &total_size)) {
-        fwprintf(stderr, L"Unable to enumerate input files, key file is missing/short, or data exceeds 4 GiB.\n");
+        fwprintf(stderr, L"Unable to enumerate input files, key file is missing/short, an entry exceeds 4 GiB, or archive offsets exceed INT64_MAX.\n");
         goto cleanup;
     }
     if (!build_hash_data(&list, &hash_data)) {
@@ -1755,7 +1764,7 @@ static int file_pack(const wchar_t *input_directory, const wchar_t *output_path)
         uint64_t offset;
         uint32_t length = (uint32_t)list.items[index].size;
         uint32_t name_length = (uint32_t)wcslen(list.items[index].relative_path);
-        if (input == NULL || !tell_position(output, &offset) || offset > UINT32_MAX) {
+        if (input == NULL || !tell_position(output, &offset)) {
             if (input != NULL) fclose(input);
             goto cleanup;
         }
@@ -1774,7 +1783,7 @@ static int file_pack(const wchar_t *input_directory, const wchar_t *output_path)
             entries[index].is_obfuscated = 2;
         }
         obfuscation_init(&obfuscation, entries[index].is_obfuscated, true, file_key, common_key);
-        entries[index].offset = (uint32_t)offset;
+        entries[index].offset = offset;
         entries[index].length = length;
         entries[index].original_length = length;
         if (!stream_pack_file(output, input, length, &obfuscation, &entries[index].hash)) {
@@ -1785,13 +1794,13 @@ static int file_pack(const wchar_t *input_directory, const wchar_t *output_path)
         wprintf(L"%ls\n", list.items[index].relative_path);
     }
 
-    /* 数据区结束位置即条目表偏移，必须能写入原格式的 uint32_t 字段。 */
+    /* 数据区结束位置即条目表的 64 位偏移；磁盘结构大小仍与旧格式一致。 */
     {
         uint64_t table_offset;
-        if (!tell_position(output, &table_offset) || table_offset > UINT32_MAX) {
+        if (!tell_position(output, &table_offset)) {
             goto cleanup;
         }
-        head.entry_offset = (uint32_t)table_offset;
+        head.entry_offset = table_offset;
     }
     /* 条目表按“名称长度、加密名称、PACKENTRY”顺序连续写入。 */
     for (index = 0; index < list.count; ++index) {
